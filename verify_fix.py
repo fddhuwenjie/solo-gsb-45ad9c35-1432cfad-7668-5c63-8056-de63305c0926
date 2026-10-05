@@ -9,6 +9,10 @@ B. 定义条款内在既有定义前插入普通说明：定义与使用语义�
 C. 历史确认（无 sig_version，只存哈希）→ 保守过期，重确认后方可生效。
 D. 过期粘性：改正文过期后即使文本改回，确认也不自动复活。
 E. 纯编号重排（同父换序）→ 确认保持有效。
+G. 隔层补入祖先：只有 3.1.1/3.1.2（无第3、3.1条）→ 确认后补入第3条
+   （仍无第3.1条）→ 子条款父级绑定改挂最近真实祖先 c-3 而过期，
+   仅确认新第3条关卡仍拒，全部重确认后放行；再补第3.1条再次过期。
+H. 上一口径确认（sig_version=2，只存哈希）→ 保守过期。
 F. HTTP 全链路（FastAPI TestClient 不可用时跳过）：签发 422、无版本行。
 """
 import copy
@@ -223,6 +227,83 @@ check("换序后引用目标签名不变（仍绑 c-2）",
       build_parts(text_order, ["c-2", "c-1", "c-3"], [])[4]["c-1"]["sig"]["refs"])
 
 
+# ---------------------------------------------------------------- G 隔层补入祖先
+print("G. 只有 3.1.1/3.1.2（无第3、3.1条）→ 隔层补入第3条")
+text_skip0 = "第1条 总则。\n第3.1.1条 子项甲。\n第3.1.2条 子项乙。\n"
+_p, clauses_g, _r, _t, pg0 = build_parts(text_skip0, [], [])
+ids_g = [c.id for c in clauses_g]
+check("解析出 c-1/c-3-1-1/c-3-1-2 而无 c-3、c-3-1",
+      ids_g == ["c-1", "c-3-1-1", "c-3-1-2"], str(ids_g))
+recs_g = confirm(pg0, ids_g, revision=1)
+st_g0 = build_status(True, recs_g, pg0, 1)
+check("全部确认后均 valid", st_g0["counts"]["valid"] == 3, str(st_g0["counts"]))
+
+# 只补入第3条（仍不补第3.1条）：子条款最近真实祖先由「无」变为 c-3
+text_skip1 = ("第1条 总则。\n第3条 补入的上层祖先。\n"
+              "第3.1.1条 子项甲。\n第3.1.2条 子项乙。\n")
+pg1, st_g1, recs_g1 = save_migrate(text_skip1, recs_g, revision=2)
+mg1 = state_map(st_g1)
+check("c-3-1-1 隔层祖先补入 → expired(parent)",
+      mg1["c-3-1-1"]["state"] == "expired"
+      and mg1["c-3-1-1"]["reasons"] == ["parent"], str(mg1["c-3-1-1"]["reasons"]))
+check("c-3-1-2 隔层祖先补入 → expired(parent)",
+      mg1["c-3-1-2"]["state"] == "expired"
+      and mg1["c-3-1-2"]["reasons"] == ["parent"], str(mg1["c-3-1-2"]["reasons"]))
+check("c-1 不受影响 → valid", mg1["c-1"]["state"] == "valid")
+check("新 c-3 为 pending", mg1["c-3"]["state"] == "pending")
+gate_g = evaluate_gate(recs_g1, pg1)
+check("签发关卡拒绝", not gate_g["ok"]
+      and [c["clause_id"] for c in gate_g["missing"]] == ["c-3"]
+      and {c["clause_id"] for c in gate_g["expired"]} == {"c-3-1-1", "c-3-1-2"})
+
+# 只确认新增的第3条，子条款仍过期 → 关卡依旧拒绝
+recs_g2 = recs_g1 + confirm(pg1, ["c-3"], revision=2)
+check("仅确认新第3条不能放行",
+      not evaluate_gate(recs_g2, pg1)["ok"])
+
+# 重新确认全部存活条款后放行
+recs_g3 = confirm(pg1, [cid for cid, p in pg1.items() if p["alive"]], revision=2)
+check("全部重确认后关卡通过", evaluate_gate(recs_g3, pg1)["ok"])
+
+# 再补第3.1条（直接父级）→ 子条款父级绑定改挂 c-3-1，再次过期
+text_skip2 = text_skip1.replace("第3.1.1条", "第3.1条 中间层。\n第3.1.1条")
+pg2, st_g2, recs_g4 = save_migrate(text_skip2, recs_g3, revision=3)
+mg2 = state_map(st_g2)
+check("再补第3.1条后 c-3-1-1/c-3-1-2 再次 expired(parent)",
+      mg2["c-3-1-1"]["state"] == "expired" and mg2["c-3-1-1"]["reasons"] == ["parent"]
+      and mg2["c-3-1-2"]["state"] == "expired" and mg2["c-3-1-2"]["reasons"] == ["parent"],
+      str((mg2["c-3-1-1"]["reasons"], mg2["c-3-1-2"]["reasons"])))
+check("c-3 自身仍 valid（其祖先链未变）", mg2["c-3"]["state"] == "valid")
+
+# 过期粘性：删回第3条、文本复原，确认也不复活
+_pg0b, st_g3, _r_g5 = save_migrate(text_skip0, recs_g1, revision=4)
+mg3 = state_map(st_g3)
+check("删回第3条后 c-3-1-1/c-3-1-2 仍 expired（粘性）",
+      mg3["c-3-1-1"]["state"] == "expired" and mg3["c-3-1-2"]["state"] == "expired")
+
+
+# ---------------------------------------------------------------- H 上一口径记录
+print("H. 上一口径确认（sig_version=2，只存哈希）→ 保守过期")
+old2 = [{
+    "clause_id": cid,
+    "revision": 1,
+    "confirmed_at": 950,
+    "sig": copy.deepcopy(pg0[cid]["sig"]),   # 哈希碰巧与当前完全一致
+    "sig_version": 2,                        # 上一签名口径
+    "expired": False,
+} for cid in ids_g]
+st_h = build_status(True, old2, pg0, 1)
+mh = state_map(st_h)
+check("sig_version=2 记录即使哈希一致也一律 expired(legacy_sig)",
+      all(mh[c]["state"] == "expired" and mh[c]["reasons"] == ["legacy_sig"]
+          for c in ids_g),
+      str([(c, mh[c]["state"], mh[c]["reasons"]) for c in ids_g]))
+check("上一口径记录无法通过签发关卡", not evaluate_gate(old2, pg0)["ok"])
+mig_h = migrate_confirmations(old2, pg0, 2)
+check("迁移后落库为 expired + legacy_sig",
+      all(r["expired"] and r["expire_reasons"] == ["legacy_sig"] for r in mig_h))
+
+
 # ---------------------------------------------------------------- F HTTP 全链路
 print("F. HTTP 全链路（保存/复核/签发）")
 try:
@@ -276,6 +357,52 @@ else:
     r = client.post(f"/api/drafts/{did}/issue", json={"revision": rev})
     check("HTTP 重确认后签发 201", r.status_code == 201, str(r.status_code))
     check("签发产生恰好 1 个版本",
+          len(client.get(f"/api/drafts/{did}/versions").json()) == 1)
+
+    # 场景 G 全链路：隔层补入第3条 → 子条款过期、签发 422、不产生版本
+    r = client.post("/api/drafts", json={"title": "G", "content": text_skip0})
+    did = r.json()["id"]
+    client.post(f"/api/drafts/{did}/review", json={"enabled": True})
+    rev = client.get(f"/api/drafts/{did}").json()["revision"]
+    r = client.post(f"/api/drafts/{did}/review/confirm",
+                    json={"revision": rev,
+                          "clause_ids": ["c-1", "c-3-1-1", "c-3-1-2"]})
+    check("HTTP 隔层场景确认成功（valid=3）",
+          r.json()["counts"]["valid"] == 3, str(r.json()["counts"]))
+    r = client.put(f"/api/drafts/{did}",
+                   json={"title": "G", "content": text_skip1})
+    rev = r.json()["revision"]
+    st = client.get(f"/api/drafts/{did}/review").json()
+    mm = state_map(st)
+    check("HTTP 隔层补入后子条款 expired(parent)",
+          mm["c-3-1-1"]["state"] == "expired"
+          and mm["c-3-1-1"]["reasons"] == ["parent"]
+          and mm["c-3-1-2"]["state"] == "expired"
+          and mm["c-3-1-2"]["reasons"] == ["parent"],
+          str({k: mm[k]["state"] for k in ("c-3-1-1", "c-3-1-2")}))
+    # 只确认新增的第3条，签发仍须 422 且不产生版本
+    client.post(f"/api/drafts/{did}/review/confirm",
+                json={"revision": rev, "clause_ids": ["c-3"]})
+    r = client.post(f"/api/drafts/{did}/issue", json={"revision": rev})
+    check("HTTP 隔层补入后仅确认第3条签发 422", r.status_code == 422,
+          str(r.status_code))
+    body = r.json()["detail"]
+    check("422 明细 expired 含 c-3-1-1/c-3-1-2",
+          {c["clause_id"] for c in body["review"]["expired"]}
+          == {"c-3-1-1", "c-3-1-2"},
+          json.dumps(body["review"], ensure_ascii=False)[:300])
+    check("422 未产生任何版本",
+          len(client.get(f"/api/drafts/{did}/versions").json()) == 0)
+    # 重新确认全部存活条款后签发成功
+    r = client.post(f"/api/drafts/{did}/review/confirm", json={
+        "revision": rev,
+        "clause_ids": ["c-1", "c-3", "c-3-1-1", "c-3-1-2"]})
+    check("HTTP 隔层场景重确认成功", r.status_code == 200
+          and r.json()["counts"]["valid"] == 4)
+    r = client.post(f"/api/drafts/{did}/issue", json={"revision": rev})
+    check("HTTP 隔层场景重确认后签发 201", r.status_code == 201,
+          str(r.status_code))
+    check("隔层场景签发产生恰好 1 个版本",
           len(client.get(f"/api/drafts/{did}/versions").json()) == 1)
 
     # 场景 B 全链路
